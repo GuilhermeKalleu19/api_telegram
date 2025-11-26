@@ -1,5 +1,6 @@
 __pycache__/
 *.pyc
 .env
+teste_siteAPIs.py
 firebase_credentials.json
 venv/
