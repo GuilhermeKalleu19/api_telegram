@@ -10,9 +10,10 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from typing import Optional
 
+# --- 1. Configuração Inicial ---
 load_dotenv()
 
-
+# Configuração do Firebase
 if not firebase_admin._apps:
     try:
         if os.path.exists("firebase_credentials.json"):
@@ -20,7 +21,7 @@ if not firebase_admin._apps:
             firebase_admin.initialize_app(cred)
             print("✅ Firebase conectado com sucesso!")
         else:
-            print("⚠️ AVISO: Arquivo 'firebase_credentials.json' não encontrado. O banco de dados não funcionará.")
+            print("⚠️ AVISO: Arquivo 'firebase_credentials.json' não encontrado.")
     except Exception as e:
         print(f"❌ Erro ao conectar Firebase: {e}")
 
@@ -30,55 +31,61 @@ API_ID = os.getenv('TELEGRAM_API_ID')
 API_HASH = os.getenv('TELEGRAM_API_HASH')
 
 if not all([API_ID, API_HASH]):
-    print("❌ ERRO: Verifique seu .env ou variáveis do Render. Falta API_ID ou API_HASH.")
+    print("❌ ERRO: Faltam credenciais API_ID/API_HASH.")
 
 app = FastAPI(
-    title="API de Alerta (Server-Side Storage)",
-    description="Login simplificado: O servidor guarda o hash temporário no Firebase."
+    title="API de Alerta (Fix Data Center)",
+    description="Correção do erro 'Code Expired' mantendo a sessão temporária no banco."
 )
 
+# --- 2. Modelos de Dados ---
 
 class LoginStartRequest(BaseModel):
-    phone: str = Field(..., description="Número do telefone com DDD (ex: +5511999999999)")
+    phone: str = Field(..., description="Número do telefone com DDD")
 
 class LoginCompleteRequest(BaseModel):
     phone: str = Field(..., description="O mesmo número usado no passo 1")
-    code: str = Field(..., description="O código numérico recebido no Telegram")
-
-    password: Optional[str] = Field(None, description="Senha 2FA (se a conta tiver).")
+    code: str = Field(..., description="Código recebido")
+    password: Optional[str] = Field(None, description="Senha 2FA (opcional)")
 
 class AlertRequest(BaseModel):
-    phone: str = Field(..., description="Telefone de QUEM está enviando")
-    contact_phone: str = Field(..., description="Telefone de QUEM vai receber")
-    message: str = Field(..., description="Mensagem de socorro")
+    phone: str
+    contact_phone: str
+    message: str
     latitude: float
     longitude: float
 
-
+# --- 3. Endpoints de Autenticação ---
 
 @app.post("/autenticacao/iniciar")
 async def login_step_1(request: LoginStartRequest):
     """
-    PASSO 1: Envia código e SALVA O HASH NO FIREBASE ('login_attempts').
+    PASSO 1: Pede o código e SALVA A SESSÃO TEMPORÁRIA + HASH no Firebase.
+    Isso garante que o Passo 2 use o mesmo Data Center.
     """
     if not db:
         raise HTTPException(500, "Erro interno: Banco de dados desconectado.")
 
+    # Cria uma sessão virgem
     client = TelegramClient(StringSession(), API_ID, API_HASH)
     await client.connect()
     
     try:
         sent_code = await client.send_code_request(request.phone)
         
-
+        # O PULO DO GATO: Salvamos o estado atual da conexão (que já sabe qual DC usar)
+        temp_session_string = client.session.save()
+        
+        # Salvamos tudo na tabela temporária
         db.collection('login_attempts').document(request.phone).set({
             'phone_code_hash': sent_code.phone_code_hash,
+            'temp_session': temp_session_string, # <--- Importante para não dar erro de DC
             'created_at': firestore.SERVER_TIMESTAMP
         })
         
         return {
             "status": "sucesso", 
-            "message": f"Código enviado para {request.phone}. Prossiga para o passo 2."
+            "message": f"Código enviado para {request.phone}."
         }
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Erro ao solicitar código: {str(e)}")
@@ -89,25 +96,31 @@ async def login_step_1(request: LoginStartRequest):
 @app.post("/autenticacao/finalizar")
 async def login_step_2(request: LoginCompleteRequest):
     """
-    PASSO 2: Recebe apenas código e telefone. Busca o hash no banco.
+    PASSO 2: Recupera a sessão temporária e finaliza o login.
     """
     if not db:
         raise HTTPException(500, "Banco de dados desconectado.")
 
-
+    # 1. Busca os dados temporários no Firebase
     doc_ref = db.collection('login_attempts').document(request.phone)
     doc = doc_ref.get()
 
     if not doc.exists:
-        raise HTTPException(400, "Sessão expirada ou não encontrada. Faça o passo 1 novamente.")
+        raise HTTPException(400, "Sessão expirada. Faça o passo 1 novamente.")
     
-    phone_code_hash = doc.to_dict().get('phone_code_hash')
+    data = doc.to_dict()
+    phone_code_hash = data.get('phone_code_hash')
+    temp_session = data.get('temp_session') # Recupera a conexão do passo 1
 
+    if not temp_session:
+        raise HTTPException(400, "Erro de estado: Sessão temporária não encontrada.")
 
-    client = TelegramClient(StringSession(), API_ID, API_HASH)
+    # 2. Conecta usando a SESSÃO TEMPORÁRIA (Isso evita o erro 'Code Expired')
+    client = TelegramClient(StringSession(temp_session), API_ID, API_HASH)
     await client.connect()
 
     try:
+        # Tenta logar
         await client.sign_in(
             phone=request.phone,
             code=request.code,
@@ -127,21 +140,22 @@ async def login_step_2(request: LoginCompleteRequest):
 
     except Exception as e:
         await client.disconnect()
+        # Se der erro, pode ser código errado mesmo
         raise HTTPException(400, f"Erro no login: {str(e)}")
 
-    
-    session_string = client.session.save()
+    # 3. Sucesso! Salva a sessão definitiva
+    final_session = client.session.save()
     await client.disconnect()
 
     try:
-        # Salva o login definitivo
+        # Salva em 'users'
         db.collection('users').document(request.phone).set({
             'phone': request.phone,
-            'session_string': session_string,
+            'session_string': final_session,
             'updated_at': firestore.SERVER_TIMESTAMP
         })
         
-        # Apaga o hash temporário (já usamos, não precisa mais)
+        # Limpa a tentativa
         doc_ref.delete()
         
     except Exception as e_db:
@@ -152,6 +166,7 @@ async def login_step_2(request: LoginCompleteRequest):
         "message": "Login realizado com sucesso!"
     }
 
+# --- 4. Endpoint de Envio (Mesma lógica) ---
 
 @app.post("/enviar-alerta")
 async def send_alert(alert: AlertRequest):
@@ -161,7 +176,7 @@ async def send_alert(alert: AlertRequest):
     doc = db.collection('users').document(alert.phone).get()
 
     if not doc.exists:
-        raise HTTPException(404, "Usuário não logado/encontrado.")
+        raise HTTPException(404, "Usuário não logado.")
     
     session_str = doc.to_dict().get('session_string')
     if not session_str:
@@ -183,7 +198,6 @@ async def send_alert(alert: AlertRequest):
         return {"status": "sucesso", "message": "Alerta enviado!"}
         
     except Exception as e:
-        print(f"Erro: {e}")
         raise HTTPException(500, f"Erro envio: {str(e)}")
     finally:
         await user_client.disconnect()
